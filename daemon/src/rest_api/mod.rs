@@ -190,6 +190,10 @@ mod test {
             DieselProductStore, Product, ProductBuilder, ProductStore, PropertyValue,
             PropertyValueBuilder,
         },
+        purchase_order::store::{
+            DieselPurchaseOrderStore, PurchaseOrder, PurchaseOrderBuilder, PurchaseOrderStore,
+            PurchaseOrderVersionBuilder,
+        },
         schema::store::{DieselSchemaStore, PropertyDefinition, Schema, SchemaStore},
     };
     use sawtooth_sdk::messages::batch::{Batch, BatchList};
@@ -205,22 +209,24 @@ mod test {
     use std::sync::mpsc::channel;
     use std::sync::Arc;
 
-    static KEY1: &str = "111111111111111111111111111111111111111111111111111111111111111111";
-    static KEY2: &str = "222222222222222222222222222222222222222222222222222222222222222222";
-    static KEY3: &str = "333333333333333333333333333333333333333333333333333333333333333333";
+    const KEY1: &str = "111111111111111111111111111111111111111111111111111111111111111111";
+    const KEY2: &str = "222222222222222222222222222222222222222222222222222222222222222222";
+    const KEY3: &str = "333333333333333333333333333333333333333333333333333333333333333333";
 
-    static ORG_NAME_1: &str = "my_org";
-    static ORG_NAME_2: &str = "other_org";
+    const ORG_NAME_1: &str = "my_org";
+    const ORG_NAME_2: &str = "other_org";
 
-    static ADDRESS_1: &str = "my_address";
-    static ADDRESS_2: &str = "my_address_2";
-    static UPDATED_ADDRESS_2: &str = "my_updated_address";
+    const ADDRESS_1: &str = "my_address";
+    const ADDRESS_2: &str = "my_address_2";
+    const UPDATED_ADDRESS_2: &str = "my_updated_address";
 
-    static BATCH_ID_1: &str = "batch_1";
-    static BATCH_ID_2: &str = "batch_2";
-    static BATCH_ID_3: &str = "batch_3";
+    const BATCH_ID_1: &str = "batch_1";
+    const BATCH_ID_2: &str = "batch_2";
+    const BATCH_ID_3: &str = "batch_3";
 
-    static TEST_SERVICE_ID: &str = "test_service";
+    const TEST_SERVICE_ID: &str = "test_service";
+
+    const PO_UID: &str = "test_po_1";
 
     #[derive(Clone)]
     enum Backend {
@@ -428,7 +434,13 @@ mod test {
                 .service(routes::list_products)
                 .service(routes::get_product)
                 .service(routes::list_schemas)
-                .service(routes::get_schema);
+                .service(routes::get_schema)
+                .service(routes::list_purchase_orders)
+                .service(routes::get_purchase_order)
+                .service(routes::list_purchase_order_versions)
+                .service(routes::get_purchase_order_version)
+                .service(routes::list_purchase_order_version_revisions)
+                .service(routes::get_purchase_order_version_revision);
 
             #[cfg(feature = "track-and-trace")]
             {
@@ -1291,6 +1303,36 @@ mod test {
 
         let mut response = srv
             .request(http::Method::GET, srv.url("/product"))
+            .send()
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+        let body: ProductListSlice =
+            serde_json::from_slice(&*response.body().await.unwrap()).unwrap();
+        assert_eq!(body.data.len(), 1);
+
+        let test_product = body.data.first().unwrap();
+        assert_eq!(test_product.product_id, "041205707820".to_string());
+        assert_eq!(test_product.product_address, "test_address".to_string());
+        assert_eq!(test_product.product_namespace, "Grid Product".to_string());
+        assert_eq!(test_product.owner, "phillips001".to_string());
+        assert_eq!(test_product.properties.len(), 2);
+    }
+
+    /// Verifies a GET /purchase_order responds with an OK response with a
+    ///     list_products request.
+    ///
+    ///     The TestServer will receive a request with no parameters,
+    ///         then will respond with an Ok status and a list of Products.
+    #[actix_rt::test]
+    async fn test_list_products() {
+        let (srv, pool) =
+            setup_test_server(Backend::Sawtooth, ResponseType::ClientBatchStatusResponseOK);
+
+        populate_purchase_order_table(get_product(None), pool);
+
+        let mut response = srv
+            .request(http::Method::GET, srv.url("/purchase_order"))
             .send()
             .await
             .unwrap();
@@ -2998,6 +3040,22 @@ mod test {
         }]
     }
 
+    fn get_purchase_order(service_id: Option<String>) -> Vec<Product> {
+        vec![
+        PurchaseOrderBuilder::new()
+            .with_uid(PO_UID.to_string())
+            .with_workflow_status("issued".to_string())
+            .with_created_at(1)
+            .with_versions(vec![purchase_order_version(PO_VERSION_ID_1)])
+            .with_is_closed(false)
+            .with_buyer_org_id(ORG_ID_1.to_string())
+            .with_seller_org_id(ORG_ID_2.to_string())
+            .with_workflow_type(POWorkflow::SystemOfRecord.to_string())
+            .build()
+            .expect("Unable to build purchase order")
+        ]
+    }
+
     fn get_product(service_id: Option<String>) -> Vec<Product> {
         let product = ProductBuilder::default()
             .with_product_id("041205707820".to_string())
@@ -3303,6 +3361,17 @@ mod test {
         products
             .into_iter()
             .for_each(|product| store.add_product(product).unwrap());
+    }
+
+    fn populate_purchase_order_table(
+        purchase_orders: Vec<PurchaseOrder>,
+        pool: Pool<ConnectionManager<SqliteConnection>>,
+    ) {
+        let store = DieselPurchaseOrderStore::new(pool);
+
+        purchase_orders
+            .into_iter()
+            .for_each(|purchase_order| store.add_purchase_order(purchase_order).unwrap());
     }
 
     #[cfg(feature = "track-and-trace")]
