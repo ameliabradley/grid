@@ -16,10 +16,13 @@ use core::future::Future;
 use futures::future;
 use std::pin::Pin;
 
-pub async fn create_async_loop<T: Future>(
+pub async fn create_async_loop<'a, 'b, T: Future>(
     start_futures: Vec<Pin<Box<T>>>,
-    mut callback: impl FnMut(T::Output, &mut dyn FnMut(Vec<Pin<Box<T>>>)),
-) {
+    mut callback: impl FnMut(T::Output, Vec<Pin<Box<T>>>) -> Pin<Box<dyn Future<Output = Vec<Pin<Box<T>>>> + 'b>>
+        + 'a,
+) where
+    'a: 'b,
+{
     let mut unfinished_futures: Vec<_> = start_futures;
 
     loop {
@@ -29,10 +32,6 @@ pub async fn create_async_loop<T: Future>(
 
         // This blocks until the next future completes
         let (event, _index, remaining) = future::select_all(unfinished_futures).await;
-        unfinished_futures = remaining;
-
-        callback(event, &mut |items| {
-            unfinished_futures.extend(items.into_iter());
-        });
+        unfinished_futures = callback(event, remaining).await;
     }
 }

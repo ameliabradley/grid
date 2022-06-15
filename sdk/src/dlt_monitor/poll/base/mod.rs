@@ -16,8 +16,6 @@ pub mod event;
 pub mod monitor;
 pub mod stream;
 
-pub use monitor::create_polling_monitor;
-
 use futures::future::BoxFuture;
 use std::fmt::Debug;
 
@@ -34,25 +32,30 @@ pub trait BatchStatus: Debug {
     fn is_unknown(&self) -> bool;
 }
 
-pub trait BatchId: Debug + Clone {
+pub trait BatchId: Debug + Clone + Sync + Send {
     fn get_id(&self) -> &str;
     fn get_service_id(&self) -> &str;
 }
 
-pub trait PendingBatchStore<T: BatchId> {
-    fn get_pending_batch_ids(&self, limit: usize) -> BatchResult<Vec<T>>;
+pub trait PendingBatchStore: Send {
+    type Id: BatchId;
+    fn get_pending_batch_ids(&self, limit: usize) -> BatchResult<Vec<Self::Id>>;
 }
 
-pub trait BatchStatusReader<T: BatchStatus> {
+pub trait BatchStatusReader: Send {
+    type Status: BatchStatus;
+
     fn get_batch_statuses<'a>(
         &'a self,
         service_id: &'a str,
         batch_ids: &'a [String],
-    ) -> BoxFuture<'a, BatchResult<Vec<T>>>;
+    ) -> BoxFuture<'a, BatchResult<Vec<Self::Status>>>;
 
     fn available_connections(&self) -> usize;
 }
 
-pub trait BatchUpdater<T: BatchStatus> {
-    fn update_batch_statuses(&self, service_id: &str, batches: &[T]) -> BatchResult<()>;
+pub trait BatchUpdater: Send {
+    type Status: BatchStatus;
+
+    fn update_batch_statuses(&self, service_id: &str, batches: &[Self::Status]) -> BatchResult<()>;
 }

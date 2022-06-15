@@ -20,9 +20,20 @@ use super::{BatchError, BatchId};
 #[derive(Debug)]
 pub enum Event<T: BatchId> {
     FetchPending,
-    FetchPendingComplete(Duration, Vec<T>),
-    FetchStatusesComplete(String, usize, Duration),
-    UpdateComplete(String, usize, Duration),
+    FetchPendingComplete {
+        duration: Duration,
+        statuses: Vec<T>,
+    },
+    FetchStatusesComplete {
+        service_id: String,
+        total: usize,
+        duration: Duration,
+    },
+    UpdateComplete {
+        service_id: String,
+        total: usize,
+        duration: Duration,
+    },
     Waiting(Duration),
     Error(BatchError),
 }
@@ -31,18 +42,26 @@ impl<T: BatchId> Display for Event<T> {
     fn fmt(&self, f: &mut Formatter<'_>) -> DisplayResult {
         match self {
             Event::FetchPending => write!(f, "fetching pending batches"),
-            Event::FetchPendingComplete(duration, statuses) => write!(
+            Event::FetchPendingComplete { duration, statuses } => write!(
                 f,
                 "found {batches} pending batches ({duration:?})",
                 batches = statuses.len()
             ),
-            Event::FetchStatusesComplete(service_id, total, duration) => {
+            Event::FetchStatusesComplete {
+                service_id,
+                total,
+                duration,
+            } => {
                 write!(
                     f,
                     "service {service_id} fetched {total} batch statuses ({duration:?})"
                 )
             }
-            Event::UpdateComplete(service_id, total, duration) => {
+            Event::UpdateComplete {
+                service_id,
+                total,
+                duration,
+            } => {
                 write!(
                     f,
                     "service {service_id} updated {total} batch statuses ({duration:?})"

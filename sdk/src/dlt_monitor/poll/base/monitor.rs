@@ -15,40 +15,45 @@
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::iter;
+use std::thread::{JoinHandle, Result as ThreadResult};
 use std::time::Instant;
+
+use tokio::runtime::Runtime;
 
 use futures::{
     channel::mpsc::{self, UnboundedReceiver, UnboundedSender},
-    future::Future,
-    StreamExt,
+    future::{self, BoxFuture},
+    SinkExt, StreamExt,
 };
 
 use super::{
-    event::Event, stream, BatchError, BatchId, BatchResult, BatchStatus, BatchStatusReader,
-    BatchUpdater, PendingBatchStore,
+    event::Event, BatchError, BatchId, BatchResult, BatchStatus, BatchStatusReader, BatchUpdater,
+    PendingBatchStore,
 };
 
-fn handle_response<I: BatchId, T: BatchStatus>(
-    emit: &mut dyn FnMut(Event<I>),
+async fn handle_response<'a, I: BatchId, T: BatchStatus, Obs: Observer<Event = Event<I>>>(
+    notifier: &Notifier<Obs>,
     service_id: String,
     start: Instant,
     pending: &[String],
     statuses: BatchResult<Vec<T>>,
-    batch_updater: &impl BatchUpdater<T>,
+    updater: &impl BatchUpdater<Status = T>,
 ) {
     match statuses {
         Err(e) => {
-            emit(Event::Error(BatchError::InternalError(format!(
+            notifier.notify(Event::Error(BatchError::InternalError(format!(
                 "encountered error {e:?} fetching batch statuses for service id \
         {service_id}"
-            ))));
+            ))))
+            .await;
         }
         Ok(statuses) => {
-            emit(Event::FetchStatusesComplete(
-                service_id.clone(),
-                statuses.len(),
-                start.elapsed(),
-            ));
+            notifier.notify(Event::FetchStatusesComplete {
+                service_id: service_id.clone(),
+                total: statuses.len(),
+                duration: start.elapsed(),
+            })
+            .await;
 
             let hash_set_pending: HashSet<_> = pending.iter().cloned().collect();
             let hash_set_response: HashSet<_> = statuses
@@ -84,51 +89,56 @@ fn handle_response<I: BatchId, T: BatchStatus>(
             }
 
             if !only_in_pending.is_empty() || !only_in_response.is_empty() {
-                emit(Event::Error(BatchError::InternalError(format!(
+                notifier.notify(Event::Error(BatchError::InternalError(format!(
                     "unexpected difference between submission and response during \
                             sanity check for service {service_id}. the following batch ids \
                             were submitted but not received back: {only_in_pending:?}. the \
                             following batch ids were received back but not submitted: \
                             {only_in_response:?}. these will not be updated."
-                ))));
+                ))))
+                .await;
             }
 
             if !unknown.is_empty() {
-                emit(Event::Error(BatchError::InternalError(format!(
+                notifier.notify(Event::Error(BatchError::InternalError(format!(
                     "batches returned unknown status: {unknown:?}"
-                ))));
+                ))))
+                .await;
             }
 
             let start = Instant::now();
-            if let Err(e) = batch_updater.update_batch_statuses(&service_id, &statuses_to_update) {
-                emit(Event::Error(BatchError::InternalError(format!(
+            if let Err(e) = updater.update_batch_statuses(&service_id, &statuses_to_update) {
+                notifier.notify(Event::Error(BatchError::InternalError(format!(
                     "encountered error {e:?} fetching batch statuses for service id \
                         {service_id}"
-                ))));
+                ))))
+                .await;
             } else {
-                emit(Event::UpdateComplete(
-                    service_id.to_string(),
-                    statuses_to_update.len(),
-                    start.elapsed(),
-                ));
+                notifier.notify(Event::UpdateComplete {
+                    service_id: service_id.to_string(),
+                    total: statuses_to_update.len(),
+                    duration: start.elapsed(),
+                })
+                .await;
             }
         }
     }
 }
 
-fn get_batches_by_service_id<I: BatchId>(
-    emit: &mut dyn FnMut(Event<I>),
-    pending_batch_store: &impl PendingBatchStore<I>,
+async fn get_batches_by_service_id<'a, I: BatchId, Obs: Observer<Event = Event<I>>>(
+    notifier: &Notifier<Obs>,
+    store: &impl PendingBatchStore<Id = I>,
     limit: usize,
 ) -> BatchResult<HashMap<String, Vec<String>>> {
-    emit(Event::FetchPending);
+    notifier.notify(Event::FetchPending).await;
 
     let begin_time = Instant::now();
-    let pending = pending_batch_store.get_pending_batch_ids(limit)?;
-    emit(Event::FetchPendingComplete(
-        begin_time.elapsed(),
-        pending.clone(),
-    ));
+    let pending = store.get_pending_batch_ids(limit)?;
+    notifier.notify(Event::FetchPendingComplete {
+        duration: begin_time.elapsed(),
+        statuses: pending.clone(),
+    })
+    .await;
 
     Ok(pending.iter().fold(
         HashMap::new(),
@@ -145,32 +155,33 @@ fn get_batches_by_service_id<I: BatchId>(
     ))
 }
 
-fn make_batch_requests<'a, I: BatchId, T: BatchStatus + 'a>(
-    emit: &mut dyn FnMut(Event<I>),
-    pending_batch_store: &impl PendingBatchStore<I>,
-    batch_status_reader: &'a impl BatchStatusReader<T>,
+async fn make_batch_requests<'a, 'b, I: BatchId, T: BatchStatus + 'a, Obs: Observer<Event = Event<I>>>(
+    notifier: &Notifier<Obs>,
+    store: &impl PendingBatchStore<Id = I>,
+    reader: &'a impl BatchStatusReader<Status = T>,
 ) -> impl Iterator<Item = WaitFor<'a, T>> {
-    let limit = batch_status_reader.available_connections();
+    let limit = reader.available_connections();
 
-    let batches_by_service_id = match get_batches_by_service_id(emit, pending_batch_store, limit) {
+    let batches_by_service_id = match get_batches_by_service_id(notifier, store, limit).await {
         Ok(batches_by_service_id) => batches_by_service_id,
         Err(e) => {
-            emit(Event::Error(BatchError::InternalError(format!(
+            notifier.notify(Event::Error(BatchError::InternalError(format!(
                 "encountered error {e:?} fetching pending batches"
-            ))));
+            ))))
+            .await;
             HashMap::new()
         }
     };
 
     batches_by_service_id
         .into_iter()
-        .map(move |(service_id, ids)| WaitFor::Request(batch_status_reader, service_id, ids))
+        .map(move |(service_id, ids)| WaitFor::Request(reader, service_id, ids))
 }
 
 /// Represents futures to wait for
 enum WaitFor<'a, T: BatchStatus> {
     /// Fire off an HTTP request and wait for the result
-    Request(&'a dyn BatchStatusReader<T>, String, Vec<String>),
+    Request(&'a dyn BatchStatusReader<Status = T>, String, Vec<String>),
 
     /// Wait for a manual poll from an external source
     Poll(UnboundedReceiver<()>),
@@ -179,12 +190,10 @@ enum WaitFor<'a, T: BatchStatus> {
 impl<'a, T: BatchStatus> WaitFor<'a, T> {
     async fn run(self) -> Handle<T> {
         match self {
-            WaitFor::Request(batch_status_reader, service_id, ids) => {
+            WaitFor::Request(reader, service_id, ids) => {
                 let start = Instant::now();
                 let service_id = service_id.to_string();
-                let result = batch_status_reader
-                    .get_batch_statuses(&service_id, &ids)
-                    .await;
+                let result = reader.get_batch_statuses(&service_id, &ids).await;
                 Handle::RequestResult(start, service_id, result, ids)
             }
             WaitFor::Poll(mut receiver) => match receiver.next().await {
@@ -206,48 +215,180 @@ enum Handle<T: BatchStatus> {
 ///
 /// # Arguments
 ///
-/// * emit - A function that receives and handles status events
-/// * pending_batch_store - A store that can retrieve pending batches
-/// * batch_status_reader - A reader that can retrieve batch statuses
-/// * batch_updater - An updater for updating the batch statuses
+/// * notify - A function that receives and handles status events
+/// * store - A store that can retrieve pending batches
+/// * reader - A reader that can retrieve batch statuses
+/// * updater - An updater for updating the batch statuses
 ///
 /// # Return value
 ///
 /// The response is a channel that can be used to cause the
 /// polling monitor to poll, and a future that causes the
 /// monitor to run.
-pub fn create_polling_monitor<'a, I: BatchId, T: BatchStatus + 'a>(
-    emit: &'a mut dyn FnMut(Event<I>),
-    pending_batch_store: &'a impl PendingBatchStore<I>,
-    batch_status_reader: &'a impl BatchStatusReader<T>,
-    batch_updater: &'a impl BatchUpdater<T>,
-) -> (UnboundedSender<()>, impl Future<Output = ()> + 'a) {
-    let (poll_listener, receiver) = mpsc::unbounded::<()>();
 
-    let async_loop = stream::create_async_loop(
-        vec![Box::pin(WaitFor::Poll(receiver).run())],
-        move |event: Handle<T>, add_items: &mut dyn FnMut(_)| match event {
-            Handle::RequestResult(start, service_id, statuses, pending) => {
-                handle_response(emit, service_id, start, &pending, statuses, batch_updater);
-            }
-            Handle::Poll(receiver) => {
-                add_items(
-                    make_batch_requests(emit, pending_batch_store, batch_status_reader)
-                        .chain(iter::once(WaitFor::Poll(receiver)))
-                        .map(|item| Box::pin(item.run()))
-                        .collect(),
-                );
-            }
-            Handle::Drain => {
-                // Do nothing.
-                //
-                // We're just not going to add any new futures,
-                // and wait for the remaining futures to complete
-            }
-        },
-    );
+pub struct PollingMonitorAssets<Id, Status, Obs, Store, Reader, Updater>
+where
+    Id: BatchId,
+    Status: BatchStatus,
+    Obs: Observer<Event = Event<Id>>,
+    Store: PendingBatchStore,
+    Reader: BatchStatusReader<Status = Status>,
+    Updater: BatchUpdater<Status = Status>,
+{
+    pub store: Store,
+    pub reader: Reader,
+    pub updater: Updater,
+    pub notifier: Notifier<Obs>,
+}
 
-    (poll_listener, async_loop)
+impl<Id, Status, Obs, Store, Reader, Updater> PollingMonitorAssets<
+    Id: BatchId,
+    Status: BatchStatus,
+    Obs: Observer<Event = Event<Id>>,
+    Store: PendingBatchStore,
+    Reader: BatchStatusReader<Status = Status>,
+    Updater: BatchUpdater<Status = Status>
+> {
+}
+
+pub trait PollingMonitorAssetBuilder: Send {
+    type Id: BatchId;
+    type Status: BatchStatus;
+    type Observer: Observer<Event = Event<Self::Id>>;
+    type Store: PendingBatchStore<Id = Self::Id>;
+    type Reader: BatchStatusReader<Status = Self::Status>;
+    type Updater: BatchUpdater<Status = Self::Status>;
+
+    fn build(
+        self,
+    ) -> PollingMonitorAssets<Self::Id, Self::Status, Self::Observer, Self::Store, Self::Reader, Self::Updater>;
+}
+
+struct RunnablePollingMonitor<B: 'static + PollingMonitorAssetBuilder> {
+    asset_builder: B,
+}
+
+impl<B: 'static + PollingMonitorAssetBuilder> RunnablePollingMonitor<B> {
+    pub fn new(asset_builder: B) -> Self {
+        RunnablePollingMonitor { asset_builder }
+    }
+
+    pub fn run(self) -> BatchResult<PollingMonitor> {
+        let (poll_listener, receiver) = mpsc::unbounded::<()>();
+
+        // Create the runtime
+        let runtime = Runtime::new().map_err(|e| BatchError::InternalError(format!("{e:?}")))?;
+
+        // Move the async runtime to a separate thread so it doesn't block this one
+        let runtime_handle = std::thread::Builder::new()
+            .name("dlt_polling_monitor_async_runtime_host".to_string())
+            .spawn(move || {
+                runtime.block_on(async move {
+                    let PollingMonitorAssets {
+                        notifier,
+                        updater,
+                        reader,
+                        store,
+                    } = self.asset_builder.build();
+
+                    let mut unfinished_futures: Vec<_> =
+                        vec![Box::pin(WaitFor::Poll(receiver).run())];
+
+                    loop {
+                        if unfinished_futures.is_empty() {
+                            break;
+                        }
+
+                        // This blocks until the next future completes
+                        let (event, _index, remaining) =
+                            future::select_all(unfinished_futures).await;
+                        unfinished_futures = remaining;
+
+                        match event {
+                            Handle::RequestResult(start, service_id, statuses, pending) => {
+                                handle_response(
+                                    &notifier,
+                                    service_id,
+                                    start,
+                                    &pending,
+                                    statuses,
+                                    &updater,
+                                )
+                                .await;
+                            }
+                            Handle::Poll(receiver) => {
+                                unfinished_futures.extend(
+                                    make_batch_requests(&notifier, &store, &reader)
+                                        .await
+                                        .chain(iter::once(WaitFor::Poll(receiver)))
+                                        .map(|item| Box::pin(item.run())), //.collect()
+                                                                           //.into_iter()
+                                );
+                            }
+                            Handle::Drain => {
+                                // Do nothing.
+                                //
+                                // We're just not going to add any new futures,
+                                // and wait for the remaining futures to complete
+                            }
+                        };
+                    }
+                })
+            })
+            .map_err(|e| BatchError::InternalError(format!("{e:?}")))?;
+
+        Ok(PollingMonitor {
+            poll_listener,
+            runtime_handle,
+        })
+    }
+}
+
+struct PollingMonitor {
+    poll_listener: UnboundedSender<()>,
+    runtime_handle: JoinHandle<()>,
+}
+
+impl PollingMonitor {
+    pub async fn poll(&mut self) -> BatchResult<()> {
+        self.poll_listener
+            .send(())
+            .await
+            .map_err(|e| BatchError::InternalError(format!("{e:?}")))
+    }
+
+    pub fn shutdown(mut self) -> ThreadResult<()> {
+        self.poll_listener.disconnect();
+        self.runtime_handle.join()
+    }
+}
+
+pub trait Observer {
+    type Event: Clone;
+
+    fn notify(&self, event: Self::Event) -> BoxFuture<'static, ()>;
+}
+
+pub struct Notifier<O: Observer> {
+    observers: Vec<O>,
+}
+
+impl<O: Observer> Notifier<O> {
+    pub fn new(observers: Vec<O>) -> Self {
+        Notifier {
+            observers
+        }
+    }
+
+    pub async fn notify(&self, event: O::Event) {
+        let _ = future::join_all(
+            self.observers
+                .iter()
+                .map(|observer| observer.notify(event.clone()))
+                .collect::<Vec<_>>(),
+        )
+        .await;
+    }
 }
 
 #[cfg(test)]
@@ -400,18 +541,22 @@ mod tests {
         }
     }
 
-    type TestPendingBatchStore = CallTester<(), BatchResult<Vec<TestBatchId>>>;
+    type TestStore = CallTester<(), BatchResult<Vec<TestBatchId>>>;
     type StatusResult<'a> = BoxFuture<'a, BatchResult<Vec<TestBatchStatus>>>;
-    type TestBatchStatusStore<'a> = CallTester<BatchStatusCall, StatusResult<'a>>;
-    type TestUpdateBatchStore = CallTester<BatchUpdateCall, BatchResult<()>>;
+    type TestReader<'a> = CallTester<BatchStatusCall, StatusResult<'a>>;
+    type TestUpdater = CallTester<BatchUpdateCall, BatchResult<()>>;
 
-    impl PendingBatchStore<TestBatchId> for TestPendingBatchStore {
+    impl PendingBatchStore for TestStore {
+        type Id = TestBatchId;
+
         fn get_pending_batch_ids(&self, _limit: usize) -> BatchResult<Vec<TestBatchId>> {
             self.call(())
         }
     }
 
-    impl BatchStatusReader<TestBatchStatus> for TestBatchStatusStore<'_> {
+    impl BatchStatusReader for TestReader<'_> {
+        type Status = TestBatchStatus;
+
         fn get_batch_statuses(
             &self,
             service_id: &str,
@@ -428,7 +573,9 @@ mod tests {
         }
     }
 
-    impl BatchUpdater<TestBatchStatus> for TestUpdateBatchStore {
+    impl BatchUpdater for TestUpdater {
+        type Status = TestBatchStatus;
+
         fn update_batch_statuses(
             &self,
             service_id: &str,
@@ -441,111 +588,140 @@ mod tests {
         }
     }
 
+    async fn event<T: BatchId>(_: Event<T>) {
+        // Do nothing
+    }
+
+    type TestAssets<'a> =
+        PollingMonitorAssets<TestBatchStatus, TestStore, TestReader<'a>, TestUpdater>;
+
+    struct TestAssetsBuilder {
+        construct: Box<dyn FnOnce() -> TestAssets<'a> + Send>,
+    }
+
+    impl<'a> PollingMonitorAssetBuilder for TestAssetsBuilder {
+        type Id = TestBatchId;
+        type Status = TestBatchStatus;
+        type Store = TestStore;
+        type Reader = TestReader<'a>;
+        type Updater = TestUpdater;
+
+        fn build(self) -> TestAssets<'a> {
+            (self.construct)()
+        }
+    }
+
     #[tokio::test]
     async fn update_sync_correctly_updates_statuses() {
-        let pending_batch_store: TestPendingBatchStore = TestBuilder::new()
-            .expect_call(
-                (),
-                Ok(vec![
-                    TestBatchId {
-                        id: "one".to_string(),
-                        service_id: "a".to_string(),
-                    },
-                    TestBatchId {
-                        id: "two".to_string(),
-                        service_id: "a".to_string(),
-                    },
-                    TestBatchId {
-                        id: "three".to_string(),
-                        service_id: "b".to_string(),
-                    },
-                    TestBatchId {
-                        id: "four".to_string(),
-                        service_id: "b".to_string(),
-                    },
-                ]),
-            )
-            .build();
+        let asset_builder = TestAssetsBuilder {
+            construct: Box::new(|| {
+                let store: TestStore = TestBuilder::new()
+                    .expect_call(
+                        (),
+                        Ok(vec![
+                            TestBatchId {
+                                id: "one".to_string(),
+                                service_id: "a".to_string(),
+                            },
+                            TestBatchId {
+                                id: "two".to_string(),
+                                service_id: "a".to_string(),
+                            },
+                            TestBatchId {
+                                id: "three".to_string(),
+                                service_id: "b".to_string(),
+                            },
+                            TestBatchId {
+                                id: "four".to_string(),
+                                service_id: "b".to_string(),
+                            },
+                        ]),
+                    )
+                    .build();
 
-        let batch_status_reader: TestBatchStatusStore = TestBuilder::new()
-            .expect_call(
-                BatchStatusCall {
-                    service_id: "a".to_string(),
-                    batch_ids: vec!["one".to_string(), "two".to_string()],
-                },
-                Box::pin(future::ok(vec![
-                    TestBatchStatus {
-                        id: "one".to_string(),
-                        status: Status::Valid,
-                    },
-                    TestBatchStatus {
-                        id: "two".to_string(),
-                        status: Status::Valid,
-                    },
-                ])) as StatusResult<'_>,
-            )
-            .expect_call(
-                BatchStatusCall {
-                    service_id: "b".to_string(),
-                    batch_ids: vec!["three".to_string(), "four".to_string()],
-                },
-                Box::pin(future::ok(vec![
-                    TestBatchStatus {
-                        id: "three".to_string(),
-                        status: Status::Valid,
-                    },
-                    TestBatchStatus {
-                        id: "four".to_string(),
-                        status: Status::Unknown,
-                    },
-                ])) as StatusResult<'_>,
-            )
-            .build();
-
-        let batch_updater: TestUpdateBatchStore = TestBuilder::new()
-            .expect_call(
-                BatchUpdateCall {
-                    service_id: "a".to_string(),
-                    statuses: vec![
-                        TestBatchStatus {
-                            id: "one".to_string(),
-                            status: Status::Valid,
+                let reader: TestReader = TestBuilder::new()
+                    .expect_call(
+                        BatchStatusCall {
+                            service_id: "a".to_string(),
+                            batch_ids: vec!["one".to_string(), "two".to_string()],
                         },
-                        TestBatchStatus {
-                            id: "two".to_string(),
-                            status: Status::Valid,
+                        Box::pin(future::ok(vec![
+                            TestBatchStatus {
+                                id: "one".to_string(),
+                                status: Status::Valid,
+                            },
+                            TestBatchStatus {
+                                id: "two".to_string(),
+                                status: Status::Valid,
+                            },
+                        ])) as StatusResult<'_>,
+                    )
+                    .expect_call(
+                        BatchStatusCall {
+                            service_id: "b".to_string(),
+                            batch_ids: vec!["three".to_string(), "four".to_string()],
                         },
-                    ],
-                },
-                Ok(()),
-            )
-            .expect_call(
-                BatchUpdateCall {
-                    service_id: "b".to_string(),
-                    statuses: vec![TestBatchStatus {
-                        id: "three".to_string(),
-                        status: Status::Valid,
-                    }],
-                },
-                Ok(()),
-            )
-            .build();
+                        Box::pin(future::ok(vec![
+                            TestBatchStatus {
+                                id: "three".to_string(),
+                                status: Status::Valid,
+                            },
+                            TestBatchStatus {
+                                id: "four".to_string(),
+                                status: Status::Unknown,
+                            },
+                        ])) as StatusResult<'_>,
+                    )
+                    .build();
 
-        let mut event = |_: Event<TestBatchId>| {};
-        let (mut sender, poller) = create_polling_monitor(
-            &mut event,
-            &pending_batch_store,
-            &batch_status_reader,
-            &batch_updater,
-        );
+                let updater: TestUpdater = TestBuilder::new()
+                    .expect_call(
+                        BatchUpdateCall {
+                            service_id: "a".to_string(),
+                            statuses: vec![
+                                TestBatchStatus {
+                                    id: "one".to_string(),
+                                    status: Status::Valid,
+                                },
+                                TestBatchStatus {
+                                    id: "two".to_string(),
+                                    status: Status::Valid,
+                                },
+                            ],
+                        },
+                        Ok(()),
+                    )
+                    .expect_call(
+                        BatchUpdateCall {
+                            service_id: "b".to_string(),
+                            statuses: vec![TestBatchStatus {
+                                id: "three".to_string(),
+                                status: Status::Valid,
+                            }],
+                        },
+                        Ok(()),
+                    )
+                    .build();
 
-        sender.send(()).await.expect("unexpected send error");
-        sender.disconnect();
+                TestAssets {
+                    notify: Box::new(|e: Event<_>| Box::pin(event(e))),
+                    store,
+                    reader,
+                    updater,
+                }
+            }),
+        };
 
-        poller.await;
+        let runnable = RunnablePollingMonitor::new(asset_builder);
+        //let monitor = runnable.run();
 
-        pending_batch_store.assert();
-        batch_status_reader.assert();
-        batch_updater.assert();
+        //monitor.poll().await.expect("unexpected send error");
+        //monitor.shutdown().expect("could not shut down");
+
+        /*
+        store.assert();
+        reader.assert();
+        updater.assert();
+        */
     }
 }
