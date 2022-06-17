@@ -22,7 +22,7 @@ use std::fmt::Debug;
 pub type BatchResult<T> = Result<T, BatchError>;
 
 // BatchError must be Send
-#[derive(Debug, Clone)]
+#[derive(Debug, PartialEq, Eq, Clone, PartialOrd, Ord)]
 pub enum BatchError {
     InternalError(String),
 }

@@ -17,22 +17,26 @@ use std::time::Duration;
 
 use super::{BatchError, BatchId};
 
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Event<T: BatchId> {
     FetchPending,
     FetchPendingComplete {
-        duration: Duration,
-        statuses: Vec<T>,
+        ids: Vec<T>,
+    },
+    FetchStatuses {
+        service_id: String,
+        batches: Vec<String>,
     },
     FetchStatusesComplete {
         service_id: String,
         total: usize,
-        duration: Duration,
+    },
+    Update {
+        service_id: String,
     },
     UpdateComplete {
         service_id: String,
         total: usize,
-        duration: Duration,
     },
     Waiting(Duration),
     Error(BatchError),
@@ -42,29 +46,40 @@ impl<T: BatchId> Display for Event<T> {
     fn fmt(&self, f: &mut Formatter<'_>) -> DisplayResult {
         match self {
             Event::FetchPending => write!(f, "fetching pending batches"),
-            Event::FetchPendingComplete { duration, statuses } => write!(
+            Event::FetchPendingComplete { ids } => write!(
                 f,
-                "found {batches} pending batches ({duration:?})",
-                batches = statuses.len()
+                "found {batches} pending batches",
+                batches = ids.len()
             ),
+            Event::FetchStatuses { service_id, batches } => {
+                write!(
+                    f,
+                    "fetching {service_id} batch statuses for [{batches}]",
+                    batches = batches.join(", ")
+                )
+            },
             Event::FetchStatusesComplete {
                 service_id,
                 total,
-                duration,
             } => {
                 write!(
                     f,
-                    "service {service_id} fetched {total} batch statuses ({duration:?})"
+                    "service {service_id} fetched {total} batch statuses"
                 )
             }
+            Event::Update { service_id } => {
+                write!(
+                    f,
+                    "updating {service_id} batch statuses"
+                )
+            },
             Event::UpdateComplete {
                 service_id,
                 total,
-                duration,
             } => {
                 write!(
                     f,
-                    "service {service_id} updated {total} batch statuses ({duration:?})"
+                    "service {service_id} updated {total} batch statuses"
                 )
             }
             Event::Waiting(frequency) => {
